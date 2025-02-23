@@ -7,7 +7,7 @@ perplexity_api_key = os.environ['PERPLEXITY_API_KEY']
 
 st.header("Prediction Market Assistant")
 
-@st.cache_data 
+@st.cache_data(persist="disk", ttl=3600)  # Cache for 1 hour
 def load_data():
     page_size, page, all_events = 200, 0, []
 
@@ -22,20 +22,21 @@ def load_data():
 
     return all_events
 
-start_time = time.time()
-events = load_data()
-st.write(f"Loaded {len(events)} events in {time.time()-start_time} seconds")
+with st.spinner('Loading events...'):
+    events = load_data()
+st.write(f"Loaded {len(events)} events")
 
 search = st.text_input("Search Events")
 
-categories = {}
+# Build categories with "-- All" option
+categories = {"-- All": events}
 for event in events:
     category = event['category']
     if category not in categories:
         categories[category] = []
     categories[category].append(event)
 
-category_selectbox = st.selectbox("Categories", sorted(categories.keys()))
+category_selectbox = st.selectbox("Categories", ["-- All"] + sorted(k for k in categories.keys() if k != "-- All"))
 
 @st.dialog("Analysis")
 def display_analysis(analysis):
@@ -85,16 +86,21 @@ def evaluate_bet(**data):
 
     display_analysis(analysis)
 
-if search and category_selectbox:
-    context_markdown = ""
-    for event in categories[category_selectbox]:
-        if search.lower() in event['title'].lower():
+if search:  # Only show results if there's a search term
+    search_terms = search.lower().split()
+    events_to_search = categories[category_selectbox]
+    
+    for event in events_to_search:
+        # Check if all search terms are in the title
+        title_lower = event['title'].lower()
+        if all(term in title_lower for term in search_terms):
             st.divider()
             bet_markdown = f"#### {event['title']}\n"
-            for market in event['markets']:
-                bet_markdown += f"##### {market['yes_sub_title']} - {market['ticker']}\n"
-                bet_markdown += f"Yes Bid: {market['yes_bid']}, Yes Ask {market['yes_ask']}\n\n"
-                bet_markdown += f"No bid: {market['no_bid']}, No Ask {market['no_ask']}\n"
+            if 'markets' in event:
+                for market in event['markets']:
+                    bet_markdown += f"##### {market['yes_sub_title']} - {market['ticker']}\n"
+                    bet_markdown += f"Yes Bid: {market['yes_bid']}, Yes Ask {market['yes_ask']}\n\n"
+                    bet_markdown += f"No bid: {market['no_bid']}, No Ask {market['no_ask']}\n"
 
-            st.button("Evaluate Bet", key=event['event_ticker'], on_click=evaluate_bet, kwargs={"ticker": event['event_ticker'], "context": bet_markdown})
-            st.markdown(bet_markdown)
+                st.button("Evaluate Bet", key=event['event_ticker'], on_click=evaluate_bet, kwargs={"ticker": event['event_ticker'], "context": bet_markdown})
+                st.markdown(bet_markdown)
