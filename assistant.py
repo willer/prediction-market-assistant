@@ -1,3 +1,4 @@
+import traceback
 import streamlit as st
 import requests, time, json, os
 from pydantic import BaseModel
@@ -7,8 +8,9 @@ perplexity_api_key = os.environ['PERPLEXITY_API_KEY']
 
 st.header("Prediction Market Assistant")
 
-@st.cache_data(persist="disk", ttl=3600)  # Cache for 1 hour
+@st.cache_data(persist="disk")
 def load_data():
+    """Fetch market data with disk persistence"""
     page_size, page, all_events = 200, 0, []
 
     r = requests.get(f"https://api.elections.kalshi.com/trade-api/v2/events?limit={page_size}&with_nested_markets=true")
@@ -50,41 +52,61 @@ def evaluate_bet(**data):
         reason: str
         confidence: int
 
+    ticker = data.get('ticker')
+    context = data.get('context')
+    market = data.get('market')
+    
     headers = {"Authorization": f"Bearer {perplexity_api_key}"}
     payload = {
         "model": "sonar-reasoning-pro",
         "messages": [{
                 "role": "system", 
-                "content": ("You are a prediction market assistant that must evaluate the current prices for event contracts on Kalshi. For each ticker, tell me if the 'yes' or 'no' contract is underpriced and why. Return a confidence score 0-100 so I know how confident you are in your prediction."
-                            "So we just need the ticker for the contract, the side 'yes' or 'no' that is underpriced, the bid price, and reason for our analysis for this contract."
-                            "Please output a JSON object containing the following fields: "
-                            "side, ticker, bid_price, reason, confidence")
+                "content": "You are a prediction market assistant. First think through your analysis in a <think> tag, then provide your final decision as a JSON object with these fields: side (yes/no), ticker (string), bid_price (integer), reason (string), confidence (integer 0-100)."
             },
-            {"role": "user", "content": data['context']},
+            {"role": "user", "content": context},
         ],
         "response_format": {
-            "type": "json_schema", "json_schema": {"schema": Contract.model_json_schema()},
+            "type": "json_schema", 
+            "json_schema": {"schema": Contract.model_json_schema()}
         },
     }
 
     response = requests.post("https://api.perplexity.ai/chat/completions", headers=headers, json=payload).json()
     content = response["choices"][0]["message"]["content"]
-
-    json_str = content.split("```json")[1].replace('```', '')
+    thinking = ""
+    json_str = ""
+    
     try:
-        response_dict = json.loads(json_str)
-        key = list(response_dict.keys())[0]
-        parsed_response = {'contracts': response_dict[key]}
+        # Split thinking and JSON parts
+        parts = content.split("</think>")
+        if len(parts) > 1:
+            thinking = parts[0].replace("<think>", "").strip()
+            json_str = parts[1].strip().replace("```json", "").replace("```", "").strip()
+        else:
+            thinking = ""
+            json_str = content
+
+        contract = json.loads(json_str)
+        
+        # Display the analysis with thinking process
+        if thinking:
+            st.markdown("*Thinking process:*")
+            st.markdown(f"*{thinking}*")
+            st.markdown("---")
+
+        # Only give 'buy' if AI is confident and suggested buy price is > current price + 3
+        ai_side = contract['side']
+        ai_price = contract['bid_price']
+        market_price = market[f"{ai_side}_bid"]
+        if contract['side'] == 'yes' and contract['confidence'] > 80 and ai_price > market_price + 3:
+            st.markdown(f"**Final Analysis:** BUY {contract['ticker']} '{ai_side}', market price at {market_price}, AI prices at {ai_price}.")
+        else:
+            st.markdown(f"**Final Analysis:** SKIP {contract['ticker']} '{ai_side}', market price at {market_price}, AI prices at {ai_price}.")
+        st.markdown(f"**Reasoning:** {contract['reason']}")
+        st.markdown(f"**Confidence:** {contract['confidence']}%")
+        
     except Exception as e:
-        json_str = '{"contracts": ' + json_str + '}'
-        parsed_response = json.loads(json_str)
-
-    print(parsed_response)
-    analysis = ""
-    for contract in parsed_response['contracts']:
-        analysis += f"Submitting {contract['side']} order for {contract['ticker']} for {contract['bid_price']} cent. {contract['reason']}\n\n"
-
-    display_analysis(analysis)
+        st.error(f"Failed to parse response: {str(e)}, traceback: {traceback.format_exc()}\nResponse was: {content}\n\nThinking was: {thinking}\nJSON was: {json_str}")
 
 if search:  # Only show results if there's a search term
     search_terms = search.lower().split()
@@ -99,8 +121,13 @@ if search:  # Only show results if there's a search term
             if 'markets' in event:
                 for market in event['markets']:
                     bet_markdown += f"##### {market['yes_sub_title']} - {market['ticker']}\n"
-                    bet_markdown += f"Yes Bid: {market['yes_bid']}, Yes Ask {market['yes_ask']}\n\n"
-                    bet_markdown += f"No bid: {market['no_bid']}, No Ask {market['no_ask']}\n"
+                    bet_markdown += f"Yes: {market['yes_bid']}-{market['yes_ask']}\n"
+                    bet_markdown += f"No: {market['no_bid']}-{market['no_ask']}\n"
 
-                st.button("Evaluate Bet", key=event['event_ticker'], on_click=evaluate_bet, kwargs={"ticker": event['event_ticker'], "context": bet_markdown})
                 st.markdown(bet_markdown)
+                st.button("Evaluate Bet", 
+                          key=event['event_ticker'], 
+                          on_click=evaluate_bet, 
+                          kwargs={"ticker": event['event_ticker'], 
+                                  "context": bet_markdown, 
+                                  "market": market})
